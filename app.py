@@ -15,6 +15,9 @@ from nlp_engine.dataset import get_default_dataset
 
 import random
 import json
+import os
+import tempfile
+import fitz  # PyMuPDF
 
 app = Flask(__name__)
 CORS(app)
@@ -190,13 +193,81 @@ def sample():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/upload-pdf", methods=["POST"])
+def upload_pdf():
+    """
+    Upload a PDF file and extract text from it.
+
+    Request: multipart/form-data with a 'file' field.
+    Optional query params: start_page, end_page (1-indexed).
+
+    Response:
+        { "text": "...", "num_pages": N, "pages_extracted": [start, end], "char_count": N }
+    """
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded. Send a PDF file with field name 'file'."}), 400
+
+    file = request.files["file"]
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        return jsonify({"error": "Only PDF files are supported."}), 400
+
+    # Save to temp file
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    try:
+        file.save(tmp.name)
+        tmp.close()
+
+        doc = fitz.open(tmp.name)
+        total_pages = len(doc)
+
+        # Optional page range (1-indexed from frontend)
+        start_page = max(int(request.form.get("start_page", 1)) - 1, 0)
+        end_page = min(int(request.form.get("end_page", total_pages)), total_pages)
+
+        # Safety cap — max 50 pages at a time
+        if end_page - start_page > 50:
+            end_page = start_page + 50
+
+        extracted_text = []
+        for page_num in range(start_page, end_page):
+            page = doc[page_num]
+            text = page.get_text("text")
+            if text.strip():
+                extracted_text.append(text.strip())
+
+        doc.close()
+
+        full_text = "\n\n".join(extracted_text)
+
+        # Clean up common PDF artifacts
+        import re
+        full_text = re.sub(r'\n{3,}', '\n\n', full_text)  # excessive newlines
+        full_text = re.sub(r'[ \t]{2,}', ' ', full_text)   # excessive spaces
+        full_text = re.sub(r'-\n(\w)', r'\1', full_text)   # hyphenated line breaks
+
+        if len(full_text.strip()) < 20:
+            return jsonify({"error": "Could not extract meaningful text from the PDF. The file may be image-based (scanned)."}), 400
+
+        return jsonify({
+            "text": full_text.strip(),
+            "num_pages": total_pages,
+            "pages_extracted": [start_page + 1, end_page],
+            "char_count": len(full_text.strip()),
+        })
+    except Exception as e:
+        return jsonify({"error": f"Failed to process PDF: {str(e)}"}), 500
+    finally:
+        os.unlink(tmp.name)
+
+
 if __name__ == "__main__":
     print("🚀 Starting AQG API server...")
     print("   Endpoints:")
-    print("   POST /api/generate  — Generate questions from text")
-    print("   POST /api/quiz      — Generate interactive quiz")
-    print("   POST /api/evaluate  — Run evaluation on SQuAD")
-    print("   GET  /api/stats     — Dataset statistics")
-    print("   GET  /api/sample    — Random sample context")
-    print("   GET  /api/health    — Health check")
+    print("   POST /api/generate    — Generate questions from text")
+    print("   POST /api/upload-pdf  — Upload PDF and extract text")
+    print("   POST /api/quiz        — Generate interactive quiz")
+    print("   POST /api/evaluate    — Run evaluation on SQuAD")
+    print("   GET  /api/stats       — Dataset statistics")
+    print("   GET  /api/sample      — Random sample context")
+    print("   GET  /api/health      — Health check")
     app.run(host="0.0.0.0", port=5001, debug=True)
