@@ -1,0 +1,202 @@
+"""
+Flask API for Automatic Question Generation
+Exposes the NLP engine via REST endpoints.
+"""
+
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+
+from nlp_engine.question_generator import generate_questions
+from nlp_engine.question_ranker import rank_questions, filter_questions
+from nlp_engine.difficulty import classify_difficulty, get_difficulty_stats
+from nlp_engine.blooms_taxonomy import classify_blooms, get_blooms_stats, BloomsLevel
+from nlp_engine.evaluator import evaluate_on_squad, generate_report
+from nlp_engine.dataset import get_default_dataset
+
+import random
+import json
+
+app = Flask(__name__)
+CORS(app)
+
+
+@app.route("/api/health", methods=["GET"])
+def health():
+    """Health check."""
+    return jsonify({"status": "ok", "service": "AQG Engine"})
+
+
+@app.route("/api/generate", methods=["POST"])
+def generate():
+    """
+    Generate questions from input text.
+
+    Request body:
+        { "text": "...", "max_questions": 10 }
+
+    Response:
+        { "questions": [...], "stats": {...} }
+    """
+    data = request.get_json()
+    if not data or "text" not in data:
+        return jsonify({"error": "Missing 'text' field"}), 400
+
+    text = data["text"].strip()
+    if len(text) < 20:
+        return jsonify({"error": "Text too short. Provide at least a few sentences."}), 400
+
+    max_q = data.get("max_questions", 10)
+
+    # Generate questions
+    raw_questions = generate_questions(text, max_questions=max_q * 2)
+    filtered = filter_questions(raw_questions)
+    ranked = rank_questions(filtered, top_k=max_q)
+
+    # Enrich with difficulty and Bloom's taxonomy
+    results = []
+    for q in ranked:
+        q_dict = q.to_dict()
+        q_dict["difficulty"] = classify_difficulty(q)
+        q_dict["blooms_level"] = classify_blooms(q)
+        q_dict["blooms_color"] = BloomsLevel.COLORS.get(q_dict["blooms_level"], "#666")
+        results.append(q_dict)
+
+    # Stats
+    stats = {
+        "total_generated": len(raw_questions),
+        "after_filtering": len(filtered),
+        "returned": len(results),
+        "difficulty": get_difficulty_stats(ranked),
+        "blooms": get_blooms_stats(ranked),
+    }
+
+    return jsonify({
+        "questions": results,
+        "stats": stats,
+    })
+
+
+@app.route("/api/quiz", methods=["POST"])
+def quiz():
+    """
+    Generate a quiz from input text.
+    🔥 Innovation #3 — Interactive quiz with answers, difficulty, and scoring.
+
+    Request body:
+        { "text": "...", "num_questions": 5, "difficulty": "all" }
+
+    Response:
+        { "quiz": [...] }
+    """
+    data = request.get_json()
+    if not data or "text" not in data:
+        return jsonify({"error": "Missing 'text' field"}), 400
+
+    text = data["text"].strip()
+    num_q = data.get("num_questions", 5)
+    difficulty_filter = data.get("difficulty", "all")
+
+    # Generate more questions than needed for filtering
+    raw_questions = generate_questions(text, max_questions=num_q * 3)
+    filtered = filter_questions(raw_questions)
+    ranked = rank_questions(filtered, top_k=num_q * 2)
+
+    # Apply difficulty filter
+    quiz_items = []
+    for q in ranked:
+        difficulty = classify_difficulty(q)
+
+        if difficulty_filter != "all" and difficulty != difficulty_filter:
+            continue
+
+        quiz_items.append({
+            "id": len(quiz_items) + 1,
+            "question": q.question,
+            "answer": q.answer,
+            "difficulty": difficulty,
+            "blooms_level": classify_blooms(q),
+            "source_sentence": q.source_sentence,
+            "question_word": q.question_word,
+        })
+
+        if len(quiz_items) >= num_q:
+            break
+
+    return jsonify({
+        "quiz": quiz_items,
+        "total_available": len(ranked),
+        "difficulty_filter": difficulty_filter,
+    })
+
+
+@app.route("/api/evaluate", methods=["POST"])
+def evaluate():
+    """
+    Run evaluation on SQuAD dataset.
+
+    Request body:
+        { "sample_size": 20, "split": "dev" }
+
+    Response:
+        { "metrics": {...}, "report": "..." }
+    """
+    data = request.get_json() or {}
+    sample_size = data.get("sample_size", 20)
+    split = data.get("split", "dev")
+
+    # Cap at reasonable size for API requests
+    sample_size = min(sample_size, 100)
+
+    results = evaluate_on_squad(sample_size=sample_size, split=split)
+    report = generate_report(results)
+
+    return jsonify({
+        "metrics": results["metrics"],
+        "report": report,
+        "sample_results": results.get("sample_results", [])[:5],
+    })
+
+
+@app.route("/api/stats", methods=["GET"])
+def stats():
+    """Get dataset statistics."""
+    try:
+        dataset = get_default_dataset()
+        dataset.load()
+        train_stats = dataset.get_stats("train")
+        dev_stats = dataset.get_stats("dev")
+        return jsonify({
+            "train": train_stats,
+            "dev": dev_stats,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/sample", methods=["GET"])
+def sample():
+    """Get a random sample context from the dataset for testing."""
+    try:
+        dataset = get_default_dataset()
+        dataset.load()
+        contexts = dataset.extract_contexts(split="dev", limit=100)
+        ctx = random.choice(contexts)
+        return jsonify({
+            "context": ctx["context"],
+            "title": ctx["title"],
+            "reference_questions": [q["question"] for q in ctx["questions"]],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+if __name__ == "__main__":
+    print("🚀 Starting AQG API server...")
+    print("   Endpoints:")
+    print("   POST /api/generate  — Generate questions from text")
+    print("   POST /api/quiz      — Generate interactive quiz")
+    print("   POST /api/evaluate  — Run evaluation on SQuAD")
+    print("   GET  /api/stats     — Dataset statistics")
+    print("   GET  /api/sample    — Random sample context")
+    print("   GET  /api/health    — Health check")
+    app.run(host="0.0.0.0", port=5001, debug=True)
